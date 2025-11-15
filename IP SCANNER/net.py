@@ -21,10 +21,13 @@ def obter_ip_mascara():
                 if match:
                     ip_local = match.group(1)
                     break
+                if platform.system() != "Windows":
+                    print("Sistema não suportado ainda (apenas Windows).")
+                return None, None
 
         # Procura máscara de sub-rede (linha que começa com M)
         for linha in linhas:
-            if linha.strip().startswith("M"):
+            if "Máscara de Sub-rede" in linha or "Subnet Mask" in linha:
                 match = re.search(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})", linha)
                 if match:
                     mascara = match.group(1)
