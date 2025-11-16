@@ -5,6 +5,7 @@ import json
 import os
 from pythonping import ping
 import platform
+import random
 
 # ---------- Controle de parada do scan ----------
 parar_scan = False
@@ -104,7 +105,7 @@ def obter_mac_arp(ip):
     return None
 
 
-# ---------- Função auxiliar para identificar via Nmap ----------
+# ---------- Função auxiliar para identificar via Nmap (SO) ----------
 def identificar_nmap(ip):
     try:
         resultado = subprocess.check_output(
@@ -123,6 +124,66 @@ def identificar_nmap(ip):
     return "Outro"
 
 
+# ---------- Função para listar portas abertas e riscos básicos ----------
+def detectar_vulnerabilidades(ip):
+    """
+    Scan rápido de portas comuns usando nmap -F e gera um resumo
+    simples de possíveis riscos (telnet, ftp, smb, rdp, etc.).
+    """
+    try:
+        # -F = portas mais comuns (mais rápido que scan completo)
+        resultado = subprocess.check_output(
+            ["nmap", "-F", ip],
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        return "Scan de portas não concluído"
+
+    portas_abertas = []
+    riscos = []
+
+    # portas que normalmente representam maior risco se expostas
+    portas_criticas = {
+        "21": "FTP",
+        "23": "Telnet",
+        "445": "SMB",
+        "3389": "RDP",
+        "5900": "VNC"
+    }
+
+    lendo_tabela = False
+    for linha in resultado.splitlines():
+        linha = linha.strip()
+        if linha.startswith("PORT"):
+            # A partir daqui começam as linhas de porta
+            lendo_tabela = True
+            continue
+        if lendo_tabela:
+            if not linha:
+                break
+            partes = linha.split()
+            if len(partes) >= 2 and "/" in partes[0]:
+                porta_proto = partes[0]        # ex: "80/tcp"
+                porta = porta_proto.split("/")[0]
+                portas_abertas.append(porta)
+
+                if porta in portas_criticas:
+                    riscos.append(f"{porta}/{portas_criticas[porta]}")
+
+    if portas_abertas:
+        resumo_portas = ", ".join(portas_abertas)
+    else:
+        resumo_portas = "nenhuma porta comum aberta"
+
+    if riscos:
+        resumo_risco = ", ".join(riscos)
+    else:
+        resumo_risco = "sem portas críticas comuns"
+
+    return f"Portas: {resumo_portas} | Riscos: {resumo_risco}"
+
+
 # ---------- Função para escanear rede ----------
 def escanear_rede(ip_local, mascara, callback=None):
     global parar_scan
@@ -131,6 +192,10 @@ def escanear_rede(ip_local, mascara, callback=None):
     try:
         rede = ipaddress.IPv4Network(f"{ip_local}/{mascara}", strict=False)
         hosts = list(rede.hosts())
+
+        # embaralha a lista de IPs (não segue 1,2,3...)
+        random.shuffle(hosts)
+
         total = len(hosts) or 1  # evita divisão por zero
 
         # Tenta descobrir o gateway (x.x.x.1)
@@ -150,7 +215,7 @@ def escanear_rede(ip_local, mascara, callback=None):
             except Exception:
                 status = "Inativo"
 
-            tipo = "Outro"
+            descricao = "Outro"
             if status == "Ativo":
                 mac = obter_mac_arp(host_str)
                 tipo = identificar_dispositivo(mac)
@@ -163,7 +228,13 @@ def escanear_rede(ip_local, mascara, callback=None):
                 if host_str == gateway:
                     tipo = "Roteador"
 
-                ativos.append((host_str, tipo))
+                # ---- Vulnerabilidades / portas abertas ----
+                resumo_vuln = detectar_vulnerabilidades(host_str)
+
+                # texto completo que vai pro painel da direita
+                descricao = f"{tipo} | {resumo_vuln}"
+
+                ativos.append((host_str, descricao))
 
             # Callback de atualização em tempo real
             if callback:
