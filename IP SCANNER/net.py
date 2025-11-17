@@ -1,250 +1,365 @@
 import subprocess
 import re
-import ipaddress
 import json
-import os
-from pythonping import ping
 import platform
-import random
-
-# ---------- Controle de parada do scan ----------
-parar_scan = False
-
-
-def solicitar_parada():
-    """Marca para o escaneamento ser interrompido assim que possível."""
-    global parar_scan
-    parar_scan = True
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def resetar_parada():
-    """Reseta o estado de parada para novos escaneamentos."""
-    global parar_scan
-    parar_scan = False
+def obter_caminho_recurso(nome_arquivo: str) -> str:
+    """
+    Retorna o caminho absoluto de um arquivo de recurso (ex: oui.json),
+    funcionando tanto no ambiente normal quanto dentro de um .exe
+    gerado pelo PyInstaller (--onefile).
+    """
+    try:
+        # Quando empacotado pelo PyInstaller, os arquivos vão para esta pasta temporária
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    except Exception:
+        # Quando rodando normalmente (python net.py), usa a pasta atual
+        base = os.path.abspath(".")
+
+    return os.path.join(base, nome_arquivo)
+
+# ---------- Carrega base de dados OUI ----------
+CAMINHO_ARQUIVO_OUI = obter_caminho_recurso("oui.json")
+
+try:
+    with open(CAMINHO_ARQUIVO_OUI, "r", encoding="utf-8") as arquivo_oui:
+        DICIONARIO_OUI = json.load(arquivo_oui)
+except Exception as erro_carregar_oui:
+    print(f"Erro ao carregar arquivo OUI.json ({CAMINHO_ARQUIVO_OUI}): {erro_carregar_oui}")
+    DICIONARIO_OUI = {}
 
 
-# ---------- Função para obter IP local e máscara ----------
+# ---------- Listar todos os IPs locais disponíveis ----------
+def listar_enderecos_rede_locais():
+    """
+    Retorna uma lista de dicionários com os IPs locais encontrados:
+
+    [
+        {"ip": "192.168.0.10", "mascara": "255.255.255.0", "descricao": "192.168.0.10 / 255.255.255.0"},
+        {"ip": "10.8.0.2", "mascara": "24", "descricao": "10.8.0.2 /24 (Linux/VPN)"},
+        ...
+    ]
+    """
+
+    lista_enderecos = []
+
+    try:
+        sistema_operacional = platform.system()
+
+        if sistema_operacional == "Windows":
+            resultado_comando = subprocess.check_output(
+                "ipconfig",
+                shell=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore"
+            )
+            linhas_saida = resultado_comando.splitlines()
+
+            lista_ips = []
+            lista_mascaras = []
+
+            for linha in linhas_saida:
+                # IPv4
+                if "IPv4" in linha:
+                    correspondencia_ip = re.search(
+                        r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+                        linha
+                    )
+                    if correspondencia_ip:
+                        lista_ips.append(correspondencia_ip.group(1))
+
+                # Máscara de Sub-rede (normalmente vem logo depois)
+                if "Máscara de Sub-rede" in linha or "Mascara de Sub-rede" in linha:
+                    correspondencia_mascara = re.search(
+                        r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+                        linha
+                    )
+                    if correspondencia_mascara:
+                        lista_mascaras.append(correspondencia_mascara.group(1))
+
+            # Junta IP com máscara pelo índice
+            for indice, endereco_ip in enumerate(lista_ips):
+                mascara_rede = lista_mascaras[indice] if indice < len(lista_mascaras) else "255.255.255.0"
+                descricao = f"{endereco_ip} / {mascara_rede}"
+                lista_enderecos.append({
+                    "ip": endereco_ip,
+                    "mascara": mascara_rede,
+                    "descricao": descricao
+                })
+
+        else:
+            # Linux: usa 'ip addr'
+            resultado_comando = subprocess.check_output(
+                "ip addr",
+                shell=True,
+                text=True
+            )
+
+            # Pega linhas do tipo: inet 192.168.0.10/24 ...
+            for linha in resultado_comando.splitlines():
+                linha = linha.strip()
+                if linha.startswith("inet ") and not linha.startswith("inet 127."):
+                    correspondencia_ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", linha)
+                    if correspondencia_ip:
+                        endereco_ip = correspondencia_ip.group(1)
+                        prefixo_rede = correspondencia_ip.group(2)
+                        descricao = f"{endereco_ip} /{prefixo_rede}"
+                        lista_enderecos.append({
+                            "ip": endereco_ip,
+                            "mascara": prefixo_rede,
+                            "descricao": descricao
+                        })
+
+    except Exception as erro_listar_ips:
+        print(f"Erro ao listar endereços de rede locais: {erro_listar_ips}")
+
+    return lista_enderecos
+
+
+# ---------- Obter IP local e máscara de rede (primeiro da lista) ----------
 def obter_ip_mascara():
-    try:
-        # Por enquanto só Windows
-        if platform.system() != "Windows":
-            print("Sistema não suportado ainda (apenas Windows).")
-            return None, None
-
-        resultado = subprocess.check_output("ipconfig", shell=True, text=True)
-        linhas = resultado.splitlines()
-        ip_local = None
-        mascara = None
-
-        # Procura IP local (IPv4)
-        for linha in linhas:
-            if "IPv4" in linha:
-                match = re.search(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})", linha)
-                if match:
-                    ip_local = match.group(1)
-                    break
-
-        # Procura máscara de sub-rede
-        for linha in linhas:
-            if "Máscara de Sub-rede" in linha or "Subnet Mask" in linha:
-                match = re.search(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})", linha)
-                if match:
-                    mascara = match.group(1)
-                    break
-
-        return ip_local, mascara
-    except Exception as e:
-        print(f"Erro ao obter IP ou máscara: {e}")
-        return None, None
-
-
-# ---------- Função para carregar banco OUI ----------
-def carregar_oui():
-    caminho = os.path.join(os.path.dirname(__file__), "oui.json")
-    if not os.path.exists(caminho):
-        print("Arquivo oui.json não encontrado.")
-        return {}
-    try:
-        with open(caminho, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Erro ao carregar OUI: {e}")
-        return {}
-
-
-OUI_DB = carregar_oui()
-
-
-# ---------- Função para identificar dispositivo pelo MAC ----------
-def identificar_dispositivo(mac):
-    if not mac:
-        return "Outro"
-
-    # Normaliza: remove separadores e usa primeiros 6 hex (3 bytes)
-    limpo = mac.upper().replace(":", "").replace("-", "")
-    prefixo = limpo[0:6]
-    return OUI_DB.get(prefixo, "Outro")
-
-
-# ---------- Função auxiliar para obter MAC via ARP ----------
-def obter_mac_arp(ip):
-    try:
-        # Usa lista de argumentos (mais seguro)
-        resultado = subprocess.check_output(
-            ["arp", "-a", ip],
-            text=True
-        )
-        linhas = resultado.splitlines()
-        for linha in linhas:
-            if ip in linha:
-                partes = linha.split()
-                if len(partes) >= 2:
-                    return partes[1]
-    except Exception:
-        return None
-    return None
-
-
-# ---------- Função auxiliar para identificar via Nmap (SO) ----------
-def identificar_nmap(ip):
-    try:
-        resultado = subprocess.check_output(
-            ["nmap", "-O", ip],
-            text=True,
-            stderr=subprocess.DEVNULL
-        )
-        if "Linux" in resultado:
-            return "Roteador/Servidor"
-        elif "Windows" in resultado:
-            return "Computador"
-        elif "iOS" in resultado or "Android" in resultado:
-            return "Celular"
-    except Exception:
-        return "Outro"
-    return "Outro"
-
-
-# ---------- Função para listar portas abertas e riscos básicos ----------
-def detectar_vulnerabilidades(ip):
     """
-    Scan rápido de portas comuns usando nmap -F e gera um resumo
-    simples de possíveis riscos (telnet, ftp, smb, rdp, etc.).
+    Mantida por compatibilidade: retorna apenas o primeiro IP encontrado.
+    Preferir usar 'listar_enderecos_rede_locais' na interface.
+    """
+    lista_enderecos = listar_enderecos_rede_locais()
+    if lista_enderecos:
+        endereco = lista_enderecos[0]
+        return endereco["ip"], endereco["mascara"]
+    return None, None
+
+
+# ---------- Obter MAC local ----------
+def obter_mac_local():
+    """
+    Retorna o endereço MAC da máquina local (primeira interface encontrada).
     """
     try:
-        # -F = portas mais comuns (mais rápido que scan completo)
-        resultado = subprocess.check_output(
-            ["nmap", "-F", ip],
-            text=True,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception:
-        return "Scan de portas não concluído"
+        if platform.system() == "Windows":
+            resultado_comando = subprocess.check_output(
+                "getmac",
+                shell=True,
+                text=True
+            )
+            correspondencia_mac = re.search(
+                r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})",
+                resultado_comando
+            )
+            if correspondencia_mac:
+                return correspondencia_mac.group(1).upper()
+        else:
+            resultado_comando = subprocess.check_output(
+                "ip link",
+                shell=True,
+                text=True
+            )
+            correspondencia_mac = re.search(
+                r"link/ether ([0-9a-fA-F:]{17})",
+                resultado_comando
+            )
+            if correspondencia_mac:
+                return correspondencia_mac.group(1).upper()
 
-    portas_abertas = []
-    riscos = []
+    except Exception as erro_mac:
+        print(f"Erro ao obter MAC local: {erro_mac}")
 
-    # portas que normalmente representam maior risco se expostas
-    portas_criticas = {
-        "21": "FTP",
-        "23": "Telnet",
-        "445": "SMB",
-        "3389": "RDP",
-        "5900": "VNC"
-    }
-
-    lendo_tabela = False
-    for linha in resultado.splitlines():
-        linha = linha.strip()
-        if linha.startswith("PORT"):
-            # A partir daqui começam as linhas de porta
-            lendo_tabela = True
-            continue
-        if lendo_tabela:
-            if not linha:
-                break
-            partes = linha.split()
-            if len(partes) >= 2 and "/" in partes[0]:
-                porta_proto = partes[0]        # ex: "80/tcp"
-                porta = porta_proto.split("/")[0]
-                portas_abertas.append(porta)
-
-                if porta in portas_criticas:
-                    riscos.append(f"{porta}/{portas_criticas[porta]}")
-
-    if portas_abertas:
-        resumo_portas = ", ".join(portas_abertas)
-    else:
-        resumo_portas = "nenhuma porta comum aberta"
-
-    if riscos:
-        resumo_risco = ", ".join(riscos)
-    else:
-        resumo_risco = "sem portas críticas comuns"
-
-    return f"Portas: {resumo_portas} | Riscos: {resumo_risco}"
+    return "Desconhecido"
 
 
-# ---------- Função para escanear rede ----------
-def escanear_rede(ip_local, mascara, callback=None):
-    global parar_scan
-    ativos = []
+# ---------- Identificar fabricante pelo OUI ----------
+def identificar_oui(endereco_mac):
+    """
+    Recebe um MAC e tenta identificar o fabricante pelo prefixo OUI.
+    """
+    if not endereco_mac or endereco_mac == "Desconhecido":
+        return "Desconhecido"
 
+    prefixo_oui = endereco_mac.upper()[0:8].replace(":", "-")  # primeiros 3 bytes
+    return DICIONARIO_OUI.get(prefixo_oui, "Desconhecido")
+
+
+# ---------- Definir tipo de dispositivo baseado no OUI + IP ----------
+def definir_tipo_dispositivo(endereco_ip, endereco_ip_local, nome_fabricante_oui):
+    """
+    Retorna uma descrição do tipo de dispositivo (roteador, celular, PC, etc).
+    """
+    if endereco_ip == endereco_ip_local:
+        return "Dispositivo Local"
+    if endereco_ip.endswith(".1"):
+        return "Roteador/Switch"
+
+    if nome_fabricante_oui == "Desconhecido":
+        return "Host"
+
+    nome_fabricante_minusculo = nome_fabricante_oui.lower()
+
+    # Apple
+    if "apple" in nome_fabricante_minusculo:
+        return "iPhone / iPad / Mac"
+
+    # Celulares
+    if "samsung" in nome_fabricante_minusculo:
+        return "Celular Samsung"
+    if "huawei" in nome_fabricante_minusculo:
+        return "Celular Huawei"
+    if "xiaomi" in nome_fabricante_minusculo or "redmi" in nome_fabricante_minusculo:
+        return "Celular Xiaomi"
+    if "motorola" in nome_fabricante_minusculo or "lenovo" in nome_fabricante_minusculo:
+        return "Celular Motorola/Lenovo"
+    if ("oppo" in nome_fabricante_minusculo or
+        "realme" in nome_fabricante_minusculo or
+        "oneplus" in nome_fabricante_minusculo):
+        return "Celular Oppo/Realme/OnePlus"
+
+    # Roteadores e switches
+    if "tp-link" in nome_fabricante_minusculo or "tplink" in nome_fabricante_minusculo:
+        return "Roteador TP-Link"
+    if "d-link" in nome_fabricante_minusculo:
+        return "Roteador D-Link"
+    if "cisco" in nome_fabricante_minusculo:
+        return "Roteador Cisco"
+    if "zte" in nome_fabricante_minusculo:
+        return "Roteador ZTE"
+
+    # Computadores
+    if ("intel" in nome_fabricante_minusculo or
+        "hewlett" in nome_fabricante_minusculo or
+        "dell" in nome_fabricante_minusculo or
+        "asus" in nome_fabricante_minusculo or
+        "micro-star" in nome_fabricante_minusculo or
+        "msi" in nome_fabricante_minusculo):
+        return "Computador/Notebook"
+
+    if ("realtek" in nome_fabricante_minusculo or
+        "broadcom" in nome_fabricante_minusculo or
+        "qualcomm" in nome_fabricante_minusculo):
+        return "Placa de Rede (PC/Notebook)"
+
+    # Consoles
+    if "xbox" in nome_fabricante_minusculo:
+        return "Console Xbox"
+    if "sony" in nome_fabricante_minusculo or "playstation" in nome_fabricante_minusculo:
+        return "Console PlayStation"
+    if "nintendo" in nome_fabricante_minusculo:
+        return "Console Nintendo"
+
+    # IoT / Dispositivos inteligentes
+    if ("gaoshengda" in nome_fabricante_minusculo or
+        "shenzhen" in nome_fabricante_minusculo or
+        "semiconductor" in nome_fabricante_minusculo):
+        return "Dispositivo IoT"
+
+    return "Host"
+
+
+# ---------- Obter MAC de um IP via ARP ----------
+def obter_mac_arp(endereco_ip):
+    """
+    Envia um ping e consulta a tabela ARP para obter o MAC do IP informado.
+    """
     try:
-        rede = ipaddress.IPv4Network(f"{ip_local}/{mascara}", strict=False)
-        hosts = list(rede.hosts())
+        if platform.system() == "Windows":
+            subprocess.run(
+                f"ping -n 1 {endereco_ip}",
+                shell=True,
+                stdout=subprocess.DEVNULL
+            )
+            resultado_comando = subprocess.check_output(
+                f"arp -a {endereco_ip}",
+                shell=True,
+                text=True
+            )
+        else:
+            subprocess.run(
+                f"ping -c 1 {endereco_ip}",
+                shell=True,
+                stdout=subprocess.DEVNULL
+            )
+            resultado_comando = subprocess.check_output(
+                f"arp {endereco_ip}",
+                shell=True,
+                text=True
+            )
 
-        # embaralha a lista de IPs (não segue 1,2,3...)
-        random.shuffle(hosts)
+        correspondencia_mac = re.search(
+            r"([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})",
+            resultado_comando
+        )
+        if correspondencia_mac:
+            return correspondencia_mac.group(1).upper()
 
-        total = len(hosts) or 1  # evita divisão por zero
+    except Exception:
+        pass
 
-        # Tenta descobrir o gateway (x.x.x.1)
-        gateway = ip_local.rsplit(".", 1)[0] + ".1"
+    return "Desconhecido"
 
-        for idx, host in enumerate(hosts, start=1):
-            # ⛔ se o usuário apertou "Parar", sai do laço
-            if parar_scan:
-                break
 
-            host_str = str(host)
+# ---------- Escanear rede ----------
+def escanear_rede(endereco_ip_local, mascara_rede, funcao_retorno_interface=None):
+    """
+    Escaneia a rede /24 do IP informado e retorna uma lista de dispositivos ativos:
+    [(ip, tipo_dispositivo, nome_oui, mac), ...]
+    Também chama 'funcao_retorno_interface' a cada IP processado (se fornecida).
+    """
+    lista_dispositivos_ativos = []
 
-            # Ping
-            try:
-                resposta = ping(host_str, count=1, timeout=1)
-                status = "Ativo" if resposta.success() else "Inativo"
-            except Exception:
-                status = "Inativo"
+    partes_ip = endereco_ip_local.split(".")
+    base_rede = f"{partes_ip[0]}.{partes_ip[1]}.{partes_ip[2]}."
 
-            descricao = "Outro"
-            if status == "Ativo":
-                mac = obter_mac_arp(host_str)
-                tipo = identificar_dispositivo(mac)
+    def ping_dispositivo(indice_host):
+        endereco_ip = f"{base_rede}{indice_host}"
+        try:
+            if platform.system() == "Windows":
+                resultado_ping = subprocess.run(
+                    f"ping -n 1 -w 100 {endereco_ip}",
+                    shell=True,
+                    stdout=subprocess.DEVNULL
+                )
+            else:
+                resultado_ping = subprocess.run(
+                    f"ping -c 1 -W 1 {endereco_ip}",
+                    shell=True,
+                    stdout=subprocess.DEVNULL
+                )
 
-                # Se OUI não identificou, tenta Nmap
-                if tipo == "Outro":
-                    tipo = identificar_nmap(host_str)
+            status_ip = "Ativo" if resultado_ping.returncode == 0 else "Inativo"
+            endereco_mac = obter_mac_arp(endereco_ip) if status_ip == "Ativo" else "Desconhecido"
+            nome_fabricante_oui = identificar_oui(endereco_mac)
+            tipo_dispositivo = definir_tipo_dispositivo(endereco_ip, endereco_ip_local, nome_fabricante_oui)
 
-                # Se for o gateway, força tipo Roteador
-                if host_str == gateway:
-                    tipo = "Roteador"
+            return (endereco_ip, tipo_dispositivo, nome_fabricante_oui, endereco_mac)
 
-                # ---- Vulnerabilidades / portas abertas ----
-                resumo_vuln = detectar_vulnerabilidades(host_str)
+        except Exception:
+            return (endereco_ip, "Desconhecido", "Desconhecido", "Desconhecido")
 
-                # texto completo que vai pro painel da direita
-                descricao = f"{tipo} | {resumo_vuln}"
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        tarefas_futuras = [
+            executor.submit(ping_dispositivo, indice_host)
+            for indice_host in range(1, 255)
+        ]
 
-                ativos.append((host_str, descricao))
+        for indice_concluido, tarefa_concluida in enumerate(as_completed(tarefas_futuras), start=1):
+            ip_dispositivo, tipo_dispositivo, nome_fabricante_oui, endereco_mac = tarefa_concluida.result()
+            lista_dispositivos_ativos.append(
+                (ip_dispositivo, tipo_dispositivo, nome_fabricante_oui, endereco_mac)
+            )
 
-            # Callback de atualização em tempo real
-            if callback:
-                progresso = int((idx / total) * 100)
-                callback(host_str, status, progresso)
+            if funcao_retorno_interface:
+                percentual_progresso = int(indice_concluido / 254 * 100)
+                status_ip = "Ativo" if endereco_mac != "Desconhecido" else "Inativo"
 
-    except Exception as e:
-        print(f"Erro ao escanear rede: {e}")
-    finally:
-        # Garante que flag de parada volte ao normal ao final
-        parar_scan = False
+                funcao_retorno_interface(
+                    ip_dispositivo,
+                    status_ip,
+                    tipo_dispositivo,
+                    nome_fabricante_oui,
+                    percentual_progresso,
+                    endereco_mac
+                )
 
-    return ativos
+    return lista_dispositivos_ativos
