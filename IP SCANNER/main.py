@@ -1,8 +1,9 @@
 """
 main.py
-Ponto de entrada do WinNetScanner
+Ponto de entrada do IP Scanner Carlos Lima
 """
-from gui import janela  # Importa a janela da GUI
+
+from gui import janela_principal  # Importa a janela principal da interface gráfica
 
 if __name__ == "__main__":
-    janela.mainloop()   # Executa a interface
+    janela_principal.mainloop()   # Inicia o loop principal da interface
